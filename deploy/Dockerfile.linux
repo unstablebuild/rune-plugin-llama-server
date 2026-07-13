@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1
+
+# Build llama-server for Linux using the same toolchain as upstream llama.cpp's
+# release pipeline (ubuntu-22.04 / ubuntu-24.04 + GCC 14). This sets the glibc
+# floor of the published binary (Ubuntu 22.04 => glibc 2.35). We do NOT lower
+# that floor: modern llama.cpp requires a recent compiler for its CPU/SIMD
+# kernels. Users on older distros compile llama-server themselves and point
+# Rune at it via models.local.server_bin_path.
+#
+# GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS build the CPU backend as several
+# runtime-loadable .so modules (one per microarchitecture); ggml selects the
+# best one for the host CPU at load time. The binary and its sibling .so
+# modules are exported together and share an $ORIGIN rpath.
+#
+# buildx selects the base image for the requested --platform, so this same
+# Dockerfile produces amd64 or arm64 binaries natively under emulation without
+# a separate cross toolchain.
+ARG BASE_IMAGE=ubuntu:22.04
+ARG JOBS=4
+
+FROM ${BASE_IMAGE} AS build
+ARG JOBS
+ENV DEBIAN_FRONTEND=noninteractive
+
+# build-essential provides make/binutils; cmake in 22.04 (>= 3.22) satisfies
+# llama.cpp's minimum. GCC 14 (from the ubuntu-toolchain-r PPA) is required to
+# compile the newest ARM CPU variants (armv9.2 + SME) that GGML_CPU_ALL_VARIANTS
+# emits; Ubuntu 22.04's stock GCC 12 rejects those -march values. This mirrors
+# upstream llama.cpp's "Toolchain workaround (GCC 14)". Building on 22.04 keeps
+# the glibc floor at 2.35 for both arches.
+RUN set -eux; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		software-properties-common ca-certificates gnupg dirmngr; \
+	add-apt-repository -y ppa:ubuntu-toolchain-r/test; \
+	apt-get update; \
+	apt-get install -y --no-install-recommends \
+		build-essential git cmake gcc-14 g++-14 libgomp1; \
+	rm -rf /var/lib/apt/lists/*
+ENV CC=gcc-14 CXX=g++-14
+
+WORKDIR /src
+COPY llama.cpp /src/llama.cpp
+
+# Portable CPU build. GGML_NATIVE=OFF plus GGML_CPU_ALL_VARIANTS emit multiple
+# CPU backend modules; GGML_BACKEND_DL makes them dlopen-loadable. The $ORIGIN
+# rpath lets the exported binary find its sibling modules. GCC 14 comes from a
+# PPA, so its libstdc++/libgcc are newer than the base image's runtime; link
+# them statically so the binary needs only glibc (>= 2.35), not a matching
+# libstdc++.
+RUN set -eux; \
+	cmake -S llama.cpp -B llama.cpp/_build \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_INSTALL_RPATH='$ORIGIN' \
+		-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+		-DLLAMA_BUILD_TESTS=OFF \
+		-DLLAMA_BUILD_EXAMPLES=OFF \
+		-DLLAMA_BUILD_TOOLS=ON \
+		-DLLAMA_BUILD_SERVER=ON \
+		-DLLAMA_BUILD_WEBUI=OFF \
+		-DLLAMA_CURL=OFF \
+		-DLLAMA_OPENSSL=OFF \
+		-DLLAMA_LLGUIDANCE=OFF \
+		-DGGML_NATIVE=OFF \
+		-DGGML_BACKEND_DL=ON \
+		-DGGML_CPU_ALL_VARIANTS=ON \
+		-DGGML_BUILD_TESTS=OFF \
+		-DGGML_BUILD_EXAMPLES=OFF \
+		-DCMAKE_EXE_LINKER_FLAGS='-static-libstdc++ -static-libgcc' \
+		-DCMAKE_SHARED_LINKER_FLAGS='-static-libstdc++ -static-libgcc'; \
+	cmake --build llama.cpp/_build --target llama-server -j "${JOBS}"; \
+	mkdir -p /out; \
+	find llama.cpp/_build/bin -maxdepth 1 \
+		\( -name 'llama-server' -o -name '*.so*' \) \
+		-exec cp -P {} /out/ \;
+
+# Export the binary and its backend modules to the build context's local
+# output.
+FROM scratch AS export
+COPY --from=build /out/ /

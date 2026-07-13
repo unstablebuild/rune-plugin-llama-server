@@ -1,0 +1,9 @@
+*.tar.gz
+*.zip
+*.swp
+*.rswp
+pkg/
+
+# Internal release configs (GCP project-ids, buckets, collections). Kept
+# locally for the dist-* make targets; never committed to a public repo.
+deploy/bluectl/

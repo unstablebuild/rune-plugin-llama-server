@@ -1,0 +1,11 @@
+# Keep the build context minimal and hermetic: only the llama.cpp source is
+# needed. Exclude host build artifacts (which carry absolute host paths in
+# CMake caches), the staging dir, tarballs, and VCS metadata.
+*
+!llama.cpp
+llama.cpp/_build
+llama.cpp/build
+**/.git
+pkg
+*.tar.gz
+*.zip
