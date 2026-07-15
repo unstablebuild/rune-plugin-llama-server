@@ -128,6 +128,14 @@ build-native:
 # modules are exported together.
 build-linux-docker:
 	@mkdir -p pkg/bin
+	@# Cross-arch builds run the foreign-arch container under QEMU user-mode
+	@# emulation. Without the binfmt_misc handlers registered, buildkit aborts
+	@# with "exec /bin/sh: exec format error". Register them (idempotent) only
+	@# when TARGET_ARCH differs from the host; native builds need no emulation.
+	@if [ "$(TARGET_ARCH)" != "$(HOST_ARCH)" ]; then \
+		echo "registering qemu binfmt handlers for cross-arch build ($(HOST_ARCH) -> $(TARGET_ARCH))"; \
+		docker run --privileged --rm tonistiigi/binfmt --install $(TARGET_ARCH); \
+	fi
 	docker buildx build \
 		--platform linux/$(TARGET_ARCH) \
 		--build-arg BASE_IMAGE=$(LINUX_BUILD_IMAGE) \
