@@ -1,6 +1,5 @@
 SRC=llama.cpp
 TAR=llama-server.tar.gz
-GTAR=gtar
 
 # Build model: same-OS, cross-arch (mirrors rune-plugin-rg). macOS hosts build
 # both darwin arches natively; Linux hosts build both linux arches inside an
@@ -10,6 +9,14 @@ HOST_OS=$(shell uname | tr '[:upper:]' '[:lower:]')
 HOST_ARCH=$(shell uname -m | sed -e 's/^x86_64$$/amd64/' -e 's/^aarch64$$/arm64/')
 TARGET_OS=$(HOST_OS)
 TARGET_ARCH?=$(HOST_ARCH)
+
+# GNU tar: named `gtar` on macOS (Homebrew coreutils), plain `tar` on Linux.
+# The --no-xattrs/--no-acls flags below are GNU extensions, so BSD tar won't do.
+ifeq ($(HOST_OS),darwin)
+GTAR ?= gtar
+else
+GTAR ?= tar
+endif
 
 # CMake / compiler knobs.
 CMAKE ?= cmake
