@@ -22,14 +22,23 @@ endif
 CMAKE ?= cmake
 JOBS ?= $(shell (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4))
 
-# LINUX_BUILD_IMAGE is the container used to build the Linux artifacts. It
-# mirrors upstream llama.cpp's release pipeline (ubuntu-22.04 / ubuntu-24.04),
-# which sets the effective glibc floor of the published binary. We do NOT try
-# to lower that floor: modern llama.cpp requires a recent compiler to build its
-# CPU/SIMD kernels, and this is a standalone, optional package. Users on older
-# distros who cannot meet the floor compile llama-server themselves and point
-# Rune at it via `models.local.server_bin_path`.
-LINUX_BUILD_IMAGE ?= ubuntu:22.04
+# The Linux artifacts are built inside a CUDA "devel" container so the package
+# ships GPU support (libggml-cuda.so) alongside the CPU backend modules; a GPU
+# is not needed at build time, only nvcc. The image is Ubuntu 22.04-based,
+# which keeps the published binary's glibc floor at 2.35 -- matching upstream
+# llama.cpp's release toolchain. We do NOT lower that floor: modern llama.cpp
+# requires a recent compiler to build its CPU/SIMD kernels, and this is a
+# standalone, optional package. Users on older distros who cannot meet the
+# floor compile llama-server themselves and point Rune at it via
+# `models.local.server_bin_path`.
+#
+# CUDA_VERSION picks the toolkit (and thus the driver floor); CUDA_ARCHITECTURES
+# selects the embedded compute capabilities ("default" = ggml's portable
+# PTX/cubin list, which runs across GPU generations).
+CUDA_VERSION ?= 12.8.1
+UBUNTU_VERSION ?= 22.04
+LINUX_BUILD_IMAGE ?= nvidia/cuda:$(CUDA_VERSION)-devel-ubuntu$(UBUNTU_VERSION)
+CUDA_ARCHITECTURES ?= default
 
 # Base CMake flags shared by every OS/arch. This matches upstream llama.cpp's
 # release build: build the server tool, keep a portable CPU baseline
@@ -91,9 +100,9 @@ default: $(TAR)
 # its runtime-loadable backend modules + config.yaml + license under pkg/. It
 # is phony so the config/license copy always runs even when the binary is
 # already built (an incremental rebuild must never produce a tarball missing
-# config.yaml or the license). Linux builds are delegated to an Ubuntu
-# container matching upstream; darwin builds run natively on the host
-# toolchain.
+# config.yaml or the license). Linux builds are delegated to the CUDA devel
+# container (see LINUX_BUILD_IMAGE) so the payload includes GPU support; darwin
+# builds run natively on the host toolchain.
 stage:
 	# Start from a clean bin/ so artifacts from a prior build (e.g. a
 	# different OS/arch, or Linux .so modules) never leak into this payload.
@@ -111,34 +120,37 @@ endif
 	cp llama.cpp/LICENSE pkg/licenses/llama.cpp/LICENSE
 
 # build-native configures and builds llama-server directly on the host (used
-# for darwin, and as the in-container step for linux). The binary and its
-# sibling backend modules (ggml*.so / libggml*.so on Linux) are staged
-# together so the $ORIGIN rpath resolves them at runtime.
+# for darwin; linux builds go through build-linux-docker). The binary and its
+# sibling libraries are staged together so the rpath (@loader_path / $ORIGIN)
+# resolves them at runtime. Staging goes through scripts/stage-libs.sh, which
+# materializes each library under its loader-requested name (install-name /
+# SONAME) as a REAL file so the payload carries no symlinks and stays portable
+# even when a downstream installer flattens it without preserving links.
 build-native:
 	@mkdir -p pkg/bin
 	$(CMAKE) -S $(SRC) -B $(SRC)/_build $(CMAKE_FLAGS)
 	$(CMAKE) --build $(SRC)/_build --target llama-server -j $(JOBS)
-	find $(SRC)/_build/bin -maxdepth 1 \
-		\( -name 'llama-server' -o -name '*.so*' -o -name '*.dylib' \) \
-		-exec cp -P {} pkg/bin/ \;
+	./scripts/stage-libs.sh $(SRC)/_build/bin pkg/bin
 
-# build-linux-docker builds llama-server for TARGET_ARCH inside an Ubuntu
-# image matching upstream llama.cpp's release toolchain (see LINUX_BUILD_IMAGE).
-# buildx provides the target-arch base image; the binary plus its backend .so
-# modules are exported together.
+# build-linux-docker builds llama-server for TARGET_ARCH inside the CUDA devel
+# image (see LINUX_BUILD_IMAGE). buildx provides the target-arch base image;
+# the binary plus its backend .so modules (CPU variants + libggml-cuda.so) are
+# exported together.
+#
+# CUDA builds must run on native hardware for the target arch: nvcc cannot run
+# under QEMU user-mode emulation, so a cross-arch CUDA build is rejected rather
+# than silently falling back to a CPU-only or broken image.
 build-linux-docker:
 	@mkdir -p pkg/bin
-	@# Cross-arch builds run the foreign-arch container under QEMU user-mode
-	@# emulation. Without the binfmt_misc handlers registered, buildkit aborts
-	@# with "exec /bin/sh: exec format error". Register them (idempotent) only
-	@# when TARGET_ARCH differs from the host; native builds need no emulation.
 	@if [ "$(TARGET_ARCH)" != "$(HOST_ARCH)" ]; then \
-		echo "registering qemu binfmt handlers for cross-arch build ($(HOST_ARCH) -> $(TARGET_ARCH))"; \
-		docker run --privileged --rm tonistiigi/binfmt --install $(TARGET_ARCH); \
+		echo "error: cross-arch Linux CUDA build ($(HOST_ARCH) -> $(TARGET_ARCH)) is not supported;" >&2; \
+		echo "       nvcc cannot run under QEMU. Build $(TARGET_ARCH) on a native $(TARGET_ARCH) host." >&2; \
+		exit 1; \
 	fi
 	docker buildx build \
 		--platform linux/$(TARGET_ARCH) \
 		--build-arg BASE_IMAGE=$(LINUX_BUILD_IMAGE) \
+		--build-arg CUDA_ARCHITECTURES=$(CUDA_ARCHITECTURES) \
 		--build-arg JOBS=$(JOBS) \
 		-f deploy/Dockerfile.linux \
 		--output type=local,dest=pkg/bin \

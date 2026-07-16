@@ -55,21 +55,42 @@ make TARGET_ARCH=arm64   # or amd64
 
 ### Linux builds
 
-Linux builds run inside an Ubuntu container via `docker buildx`, matching
-upstream llama.cpp's own release toolchain (Ubuntu 22.04 / GCC). This sets the
-glibc floor of the published binary (Ubuntu 22.04 ⇒ **glibc ≥ 2.35**). We do
-not lower that floor: modern llama.cpp needs a recent compiler to build its
-CPU/SIMD kernels. The base image is configurable:
+Linux builds run inside an NVIDIA CUDA **devel** container via `docker buildx`
+so the package ships GPU support; a GPU is not needed at build time, only
+nvcc. The image is Ubuntu 22.04-based, matching upstream llama.cpp's release
+toolchain, which sets the glibc floor of the published binary (Ubuntu 22.04 ⇒
+**glibc ≥ 2.35**). We do not lower that floor: modern llama.cpp needs a recent
+compiler to build its CPU/SIMD kernels. The image and CUDA settings are
+configurable:
 
 ```
-make LINUX_BUILD_IMAGE=ubuntu:22.04   # default
+make CUDA_VERSION=12.8.1 UBUNTU_VERSION=22.04   # defaults
+make CUDA_ARCHITECTURES=default                 # portable PTX list (default)
+make LINUX_BUILD_IMAGE=nvidia/cuda:12.8.1-devel-ubuntu22.04  # or override outright
 ```
 
-The CPU backend is built as several runtime-loadable modules (`ggml*.so`, one
-per microarchitecture) via `GGML_BACKEND_DL` + `GGML_CPU_ALL_VARIANTS`, exactly
-like upstream; ggml selects the best module for the host CPU at load time. The
-binary and its sibling `.so` modules ship together under `bin/` and share an
-`$ORIGIN` rpath.
+Backends are built as runtime-loadable modules via `GGML_BACKEND_DL`:
+`GGML_CPU_ALL_VARIANTS` emits one `ggml-cpu-<arch>.so` per microarchitecture,
+and `GGML_CUDA=ON` adds `libggml-cuda.so`. At load time ggml enumerates the
+sibling `ggml-*.so` modules and selects the best backend for the host — the
+CUDA module when an NVIDIA GPU and driver are present, otherwise the
+best-matching CPU module — so one package runs on both GPU and CPU-only hosts.
+The binary and its sibling `.so` modules ship together under `bin/` and share
+an `$ORIGIN` rpath.
+
+The NVIDIA CUDA runtime libraries are **not** bundled: doing so would grow the
+package by ~1GB and pull NVIDIA's CUDA EULA into an otherwise MIT-only
+package. GPU offload therefore requires the host to provide, in addition to
+the NVIDIA driver (`libcuda.so.1`), a CUDA 12 runtime (`libcudart.so.12`,
+`libcublas.so.12`, `libcublasLt.so.12`) — e.g. the distro's
+`nvidia-cuda-toolkit` runtime packages. Hosts without them simply run on the
+CPU backend; ggml skips the CUDA module when its dependencies are absent. The
+C++ runtime is linked statically into the binary and every module
+(`-static-libstdc++`/`-static-libgcc`, including `CMAKE_MODULE_LINKER_FLAGS`
+for the dlopen'd backend modules), so no host libstdc++ newer than the glibc
+floor is required. Because nvcc cannot run under QEMU, Linux CUDA builds must
+run on native hardware for the target arch; cross-arch Linux builds are
+rejected.
 
 Hosts that cannot meet the glibc floor should compile `llama-server`
 themselves and point Rune at it with `models.local.server_bin_path`.

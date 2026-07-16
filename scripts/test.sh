@@ -43,6 +43,17 @@ if printf '%s\n' "$members" | grep -q '\.so$'; then
 		exit 1
 	fi
 	echo "ok: $TAR bundles ggml CPU backend modules"
+
+	# The Linux package is built with CUDA (GGML_CUDA=ON) so GPU hosts can
+	# offload; the CUDA backend ships as a loadable libggml-cuda.so next to the
+	# CPU modules. Require it so a package silently missing GPU support (e.g. a
+	# CUDA-less rebuild) never ships.
+	if ! printf '%s\n' "$members" | grep -qE '^\./bin/libggml-cuda\.so'; then
+		echo "error: $TAR ships .so modules but no ggml CUDA backend module" >&2
+		printf 'members:\n%s\n' "$members" >&2
+		exit 1
+	fi
+	echo "ok: $TAR bundles the ggml CUDA backend module"
 fi
 
 # No C/C++ sources should leak into the release.

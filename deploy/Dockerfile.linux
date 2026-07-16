@@ -1,33 +1,54 @@
 # syntax=docker/dockerfile:1
 
-# Build llama-server for Linux using the same toolchain as upstream llama.cpp's
-# release pipeline (ubuntu-22.04 / ubuntu-24.04 + GCC 14). This sets the glibc
-# floor of the published binary (Ubuntu 22.04 => glibc 2.35). We do NOT lower
-# that floor: modern llama.cpp requires a recent compiler for its CPU/SIMD
-# kernels. Users on older distros compile llama-server themselves and point
-# Rune at it via models.local.server_bin_path.
+# Build llama-server for Linux with CUDA GPU support, using a CUDA "devel"
+# base image so nvcc and the CUDA toolkit are available at build time (a GPU is
+# NOT required to build). The image is Ubuntu 22.04-based, which keeps the
+# published binary's glibc floor at 2.35 -- matching upstream llama.cpp's
+# release toolchain. We do NOT lower that floor: modern llama.cpp requires a
+# recent compiler for its CPU/SIMD kernels. Users on older distros compile
+# llama-server themselves and point Rune at it via models.local.server_bin_path.
 #
-# GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS build the CPU backend as several
-# runtime-loadable .so modules (one per microarchitecture); ggml selects the
-# best one for the host CPU at load time. The binary and its sibling .so
-# modules are exported together and share an $ORIGIN rpath.
+# Backends ship as runtime-loadable modules (GGML_BACKEND_DL=ON):
+#   * GGML_CPU_ALL_VARIANTS emits one ggml-cpu-<arch>.so per microarchitecture.
+#   * GGML_CUDA=ON emits libggml-cuda.so.
+# At load time ggml enumerates the sibling ggml-*.so modules and selects the
+# best backend for the host: the CUDA module when an NVIDIA GPU + driver are
+# present, otherwise the best-matching CPU module. One package therefore runs
+# on both GPU and CPU-only hosts with no binary changes.
 #
-# buildx selects the base image for the requested --platform, so this same
-# Dockerfile produces amd64 or arm64 binaries natively under emulation without
-# a separate cross toolchain.
-ARG BASE_IMAGE=ubuntu:22.04
+# The CUDA runtime libraries (libcudart, libcublas, libcublasLt) are NOT
+# bundled: doing so would grow the package by ~1GB and pull NVIDIA's CUDA EULA
+# into an otherwise MIT-only package. libggml-cuda.so therefore links them
+# dynamically, so a GPU host must have a matching CUDA 12 runtime plus the
+# NVIDIA driver installed; CPU-only hosts are unaffected because ggml simply
+# skips the CUDA module when its dependencies are absent. The C++ runtime IS
+# linked statically everywhere (-static-libstdc++/-static-libgcc) so nothing
+# requires a libstdc++ newer than the glibc-floor host provides. The ggml
+# backend modules are CMake MODULE libraries, so the flags must be present in
+# CMAKE_MODULE_LINKER_FLAGS as well as the EXE/SHARED variants. NCCL
+# (multi-GPU collectives) is disabled to avoid an extra runtime dependency.
+#
+# buildx selects the base image for the requested --platform. CUDA builds must
+# run on native hardware for the target arch (QEMU cross-emulation of nvcc is
+# not supported), so cross-arch Linux CUDA builds are not attempted here.
+ARG CUDA_VERSION=12.8.1
+ARG UBUNTU_VERSION=22.04
+ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION}
 ARG JOBS=4
+# CUDA compute capabilities to embed. "default" lets ggml pick its portable
+# PTX/cubin list so the module runs across GPU generations.
+ARG CUDA_ARCHITECTURES=default
 
 FROM ${BASE_IMAGE} AS build
 ARG JOBS
+ARG CUDA_ARCHITECTURES
 ENV DEBIAN_FRONTEND=noninteractive
 
-# build-essential provides make/binutils; cmake in 22.04 (>= 3.22) satisfies
-# llama.cpp's minimum. GCC 14 (from the ubuntu-toolchain-r PPA) is required to
-# compile the newest ARM CPU variants (armv9.2 + SME) that GGML_CPU_ALL_VARIANTS
-# emits; Ubuntu 22.04's stock GCC 12 rejects those -march values. This mirrors
-# upstream llama.cpp's "Toolchain workaround (GCC 14)". Building on 22.04 keeps
-# the glibc floor at 2.35 for both arches.
+# GCC 14 (from the ubuntu-toolchain-r PPA) is required to compile the newest ARM
+# CPU variants (armv9.2 + SME) that GGML_CPU_ALL_VARIANTS emits; Ubuntu 22.04's
+# stock GCC 12 rejects those -march values. This mirrors upstream llama.cpp's
+# "Toolchain workaround (GCC 14)". nvcc uses g++-14 as its host compiler via
+# CUDAHOSTCXX. Building on 22.04 keeps the glibc floor at 2.35 for both arches.
 RUN set -eux; \
 	apt-get update; \
 	apt-get install -y --no-install-recommends \
@@ -37,18 +58,26 @@ RUN set -eux; \
 	apt-get install -y --no-install-recommends \
 		build-essential git cmake gcc-14 g++-14 libgomp1; \
 	rm -rf /var/lib/apt/lists/*
-ENV CC=gcc-14 CXX=g++-14
+ENV CC=gcc-14 CXX=g++-14 CUDAHOSTCXX=g++-14
 
 WORKDIR /src
 COPY llama.cpp /src/llama.cpp
+COPY scripts/stage-libs.sh /src/scripts/stage-libs.sh
 
-# Portable CPU build. GGML_NATIVE=OFF plus GGML_CPU_ALL_VARIANTS emit multiple
-# CPU backend modules; GGML_BACKEND_DL makes them dlopen-loadable. The $ORIGIN
-# rpath lets the exported binary find its sibling modules. GCC 14 comes from a
-# PPA, so its libstdc++/libgcc are newer than the base image's runtime; link
-# them statically so the binary needs only glibc (>= 2.35), not a matching
-# libstdc++.
+# Portable build. GGML_NATIVE=OFF plus GGML_CPU_ALL_VARIANTS emit multiple CPU
+# backend modules; GGML_CUDA=ON adds the CUDA backend module; GGML_BACKEND_DL
+# makes them all dlopen-loadable. The $ORIGIN rpath lets the exported binary
+# find its sibling modules. GCC 14 comes from a PPA, so its libstdc++/libgcc are
+# newer than the base image's runtime; link them statically so the binary needs
+# only glibc (>= 2.35), not a matching libstdc++. --allow-shlib-undefined is
+# needed because ggml's DL modules resolve some symbols against the loader at
+# runtime rather than at link time.
 RUN set -eux; \
+	if [ "${CUDA_ARCHITECTURES}" = "default" ]; then \
+		cuda_arch_flag=""; \
+	else \
+		cuda_arch_flag="-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}"; \
+	fi; \
 	cmake -S llama.cpp -B llama.cpp/_build \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DCMAKE_INSTALL_RPATH='$ORIGIN' \
@@ -64,15 +93,16 @@ RUN set -eux; \
 		-DGGML_NATIVE=OFF \
 		-DGGML_BACKEND_DL=ON \
 		-DGGML_CPU_ALL_VARIANTS=ON \
+		-DGGML_CUDA=ON \
+		-DGGML_CUDA_NCCL=OFF \
+		$cuda_arch_flag \
 		-DGGML_BUILD_TESTS=OFF \
 		-DGGML_BUILD_EXAMPLES=OFF \
-		-DCMAKE_EXE_LINKER_FLAGS='-static-libstdc++ -static-libgcc' \
-		-DCMAKE_SHARED_LINKER_FLAGS='-static-libstdc++ -static-libgcc'; \
+		-DCMAKE_EXE_LINKER_FLAGS='-static-libstdc++ -static-libgcc -Wl,--allow-shlib-undefined' \
+		-DCMAKE_SHARED_LINKER_FLAGS='-static-libstdc++ -static-libgcc -Wl,--allow-shlib-undefined' \
+		-DCMAKE_MODULE_LINKER_FLAGS='-static-libstdc++ -static-libgcc -Wl,--allow-shlib-undefined'; \
 	cmake --build llama.cpp/_build --target llama-server -j "${JOBS}"; \
-	mkdir -p /out; \
-	find llama.cpp/_build/bin -maxdepth 1 \
-		\( -name 'llama-server' -o -name '*.so*' \) \
-		-exec cp -P {} /out/ \;
+	sh /src/scripts/stage-libs.sh llama.cpp/_build/bin /out
 
 # Export the binary and its backend modules to the build context's local
 # output.
