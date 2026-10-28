@@ -45,7 +45,9 @@ CUDA_ARCHITECTURES ?= default
 # (GGML_NATIVE=OFF), and ship the CPU backend as runtime-loadable modules
 # (GGML_BACKEND_DL + GGML_CPU_ALL_VARIANTS) so one package runs across CPU
 # generations. A relative rpath (set per-OS below) lets the binary find its
-# sibling backend modules.
+# sibling backend modules. Rune only talks to the server's HTTP API, so the
+# web UI is left out: LLAMA_USE_PREBUILT_UI would otherwise download it from
+# Hugging Face at build time and embed it in the binary.
 CMAKE_FLAGS := \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
@@ -53,8 +55,8 @@ CMAKE_FLAGS := \
   -DLLAMA_BUILD_EXAMPLES=OFF \
   -DLLAMA_BUILD_TOOLS=ON \
   -DLLAMA_BUILD_SERVER=ON \
-  -DLLAMA_BUILD_WEBUI=OFF \
-  -DLLAMA_CURL=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF \
   -DLLAMA_OPENSSL=OFF \
   -DLLAMA_LLGUIDANCE=OFF \
   -DGGML_NATIVE=OFF \

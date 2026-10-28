@@ -71,7 +71,7 @@ COPY scripts/stage-libs.sh /src/scripts/stage-libs.sh
 # newer than the base image's runtime; link them statically so the binary needs
 # only glibc (>= 2.35), not a matching libstdc++. --allow-shlib-undefined is
 # needed because ggml's DL modules resolve some symbols against the loader at
-# runtime rather than at link time.
+# runtime rather than at link time. The web UI is left out (see the Makefile).
 RUN set -eux; \
 	if [ "${CUDA_ARCHITECTURES}" = "default" ]; then \
 		cuda_arch_flag=""; \
@@ -86,8 +86,8 @@ RUN set -eux; \
 		-DLLAMA_BUILD_EXAMPLES=OFF \
 		-DLLAMA_BUILD_TOOLS=ON \
 		-DLLAMA_BUILD_SERVER=ON \
-		-DLLAMA_BUILD_WEBUI=OFF \
-		-DLLAMA_CURL=OFF \
+		-DLLAMA_BUILD_UI=OFF \
+		-DLLAMA_USE_PREBUILT_UI=OFF \
 		-DLLAMA_OPENSSL=OFF \
 		-DLLAMA_LLGUIDANCE=OFF \
 		-DGGML_NATIVE=OFF \
